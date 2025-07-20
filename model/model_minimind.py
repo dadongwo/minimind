@@ -80,6 +80,12 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+# Type alias for cleaner type hints
+PastKeyValueType = Union[
+    Tuple[torch.Tensor, torch.Tensor],                    # (past_k, past_v)
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor]      # (past_k, past_v, past_attention_mask)
+]
+
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
@@ -146,9 +152,9 @@ class Attention(nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
-                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-                use_cache=False,
-                attention_mask: Optional[torch.Tensor] = None):
+                past_key_value: Optional[PastKeyValueType] = None,
+                use_cache: bool = False,
+                attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]]:
         bsz, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
@@ -158,32 +164,54 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
-        # kv_cache实现 - now includes attention mask caching
+        # Robust kv_cache implementation with proper validation
         past_attention_mask = None
         if past_key_value is not None:
-            # Handle both old format (k, v) and new format (k, v, attention_mask)
-            if len(past_key_value) == 3:
-                past_k, past_v, past_attention_mask = past_key_value
-            else:
-                # Backward compatibility: assume old format (k, v) only
+            if len(past_key_value) == 2:
+                # Standard format: (past_k, past_v)
                 past_k, past_v = past_key_value
                 past_attention_mask = None
+            elif len(past_key_value) == 3:
+                # Extended format: (past_k, past_v, past_attention_mask)
+                past_k, past_v, potential_mask = past_key_value
+                # Validate that the third element is actually an attention mask tensor
+                if (potential_mask is not None and 
+                    isinstance(potential_mask, torch.Tensor) and 
+                    potential_mask.dim() >= 2):
+                    past_attention_mask = potential_mask
+                else:
+                    # Invalid third element - treat as 2-tuple format
+                    past_attention_mask = None
+                    if potential_mask is not None:
+                        # Log warning about invalid format (in a real implementation, use proper logging)
+                        pass  # Could add logging here: logger.warning("Invalid attention mask in past_key_value, ignoring")
+            else:
+                raise ValueError(f"past_key_value must be a 2-tuple or 3-tuple, got {len(past_key_value)}-tuple")
+            
+            # Validate tensor shapes for k and v
+            if not (isinstance(past_k, torch.Tensor) and isinstance(past_v, torch.Tensor)):
+                raise TypeError("past_k and past_v must be torch.Tensor")
             
             xk = torch.cat([past_k, xk], dim=1)
             xv = torch.cat([past_v, xv], dim=1)
         
-        # Cache the current attention mask for future use
+        # Determine full attention mask for caching
         if use_cache:
             if past_attention_mask is not None and attention_mask is not None:
                 # Combine past and current attention masks
                 full_attention_mask = torch.cat([past_attention_mask, attention_mask], dim=1)
             elif attention_mask is not None:
-                # First time caching
+                # First time caching with attention mask
                 full_attention_mask = attention_mask
+            elif past_attention_mask is not None:
+                # Only past attention mask available (edge case)
+                full_attention_mask = past_attention_mask
             else:
                 # No attention mask provided
                 full_attention_mask = None
-            past_kv = (xk, xv, full_attention_mask) if full_attention_mask is not None else (xk, xv)
+            
+            # Always return consistent 3-tuple format: (k, v, attention_mask_or_None)
+            past_kv = (xk, xv, full_attention_mask)
         else:
             past_kv = None
 
@@ -456,7 +484,12 @@ class MiniMindBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+    def forward(self, 
+                hidden_states: torch.Tensor, 
+                position_embeddings: Tuple[torch.Tensor, torch.Tensor], 
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = None, 
+                use_cache: bool = False, 
+                attention_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]]:
         residual = hidden_states
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
