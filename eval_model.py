@@ -26,7 +26,7 @@ def move_to_device(model_or_tensor, device_arg):
             import torch_directml
             return model_or_tensor.to(torch_directml.device())
         else:
-            device = device_manager.get_default_device()
+            device = device_manager.get_device_object()
             return model_or_tensor.to(device)
     elif 'privateuseone' in str(device_arg):
         import torch_directml
@@ -51,7 +51,7 @@ def init_model(args):
         # 支持DirectML设备的模型加载
         if args.device == 'auto':
             from utils.device_utils import device_manager
-            device = device_manager.get_default_device()
+            device = device_manager.get_device_object()
             if device_manager.device_type == 'directml':
                 # DirectML需要先加载到CPU再转移
                 state_dict = torch.load(ckp, map_location='cpu')

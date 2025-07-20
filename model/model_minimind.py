@@ -187,7 +187,8 @@ class Attention(nn.Module):
                 
                 # Combine causal and padding masks
                 combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) + padding_mask
-                combined_mask = combined_mask.bool() if combined_mask.dtype != torch.bool else combined_mask
+                # For additive masks: 0.0 = attend, -inf = ignore
+                # Keep as additive mask for scaled_dot_product_attention
                 
                 output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=combined_mask, dropout_p=dropout_p, is_causal=False)
             else:

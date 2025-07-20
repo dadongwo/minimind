@@ -24,7 +24,7 @@ class AMDCompatibilityTester:
     
     def __init__(self):
         self.device_config = get_device_specific_config()
-        self.device = device_manager.get_default_device()
+        self.device = device_manager.get_device_object()
         self.test_results = {}
         
     def run_all_tests(self) -> Dict[str, bool]:

@@ -184,7 +184,7 @@ def init_model(lm_config):
             import torch_directml
             model = model.to(torch_directml.device())
         else:
-            device = device_manager.get_default_device()
+            device = device_manager.get_device_object()
             model = model.to(device)
     else:
         model = model.to(args.device)

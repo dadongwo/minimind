@@ -74,7 +74,7 @@ def test_flash_attention_compatibility():
 
     # 获取设备配置
     device_config = get_device_specific_config()
-    device = device_manager.get_default_device()
+    device = device_manager.get_device_object()
 
     print(f"设备类型: {device_config['device_type']}")
     print(f"设备: {device}")
@@ -282,7 +282,7 @@ def benchmark_attention_backends():
     print("\n🏁 注意力机制性能对比")
     print("=" * 50)
     
-    device = device_manager.get_default_device()
+    device = device_manager.get_device_object()
     
     # 测试参数
     configs = [
