@@ -124,7 +124,7 @@ def train_epoch(epoch, wandb):
                     "step": step
                 })
 
-        if step % args.save_interval == 0:
+        if step > 0 and step % args.save_interval == 0:
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.out_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
             # 确保只有rank 0进程保存模型，避免多进程同时写入
@@ -278,7 +278,9 @@ if __name__ == "__main__":
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-        model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
+        # 仅在GPU可用时设置device_ids，CPU训练时需要device_ids=None
+        device_ids = [ddp_local_rank] if device_manager.is_gpu_available() else None
+        model = DistributedDataParallel(model, device_ids=device_ids)
 
     iter_per_epoch = len(train_loader)
     logger(f"开始训练: {args.epochs} epochs, {iter_per_epoch} steps/epoch")

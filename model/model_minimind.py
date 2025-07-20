@@ -146,7 +146,7 @@ class Attention(nn.Module):
     def forward(self,
                 x: torch.Tensor,
                 position_embeddings: Tuple[torch.Tensor, torch.Tensor],  # 修改为接收cos和sin
-                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
@@ -158,11 +158,34 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
-        # kv_cache实现
+        # kv_cache实现 - now includes attention mask caching
+        past_attention_mask = None
         if past_key_value is not None:
-            xk = torch.cat([past_key_value[0], xk], dim=1)
-            xv = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (xk, xv) if use_cache else None
+            # Handle both old format (k, v) and new format (k, v, attention_mask)
+            if len(past_key_value) == 3:
+                past_k, past_v, past_attention_mask = past_key_value
+            else:
+                # Backward compatibility: assume old format (k, v) only
+                past_k, past_v = past_key_value
+                past_attention_mask = None
+            
+            xk = torch.cat([past_k, xk], dim=1)
+            xv = torch.cat([past_v, xv], dim=1)
+        
+        # Cache the current attention mask for future use
+        if use_cache:
+            if past_attention_mask is not None and attention_mask is not None:
+                # Combine past and current attention masks
+                full_attention_mask = torch.cat([past_attention_mask, attention_mask], dim=1)
+            elif attention_mask is not None:
+                # First time caching
+                full_attention_mask = attention_mask
+            else:
+                # No attention mask provided
+                full_attention_mask = None
+            past_kv = (xk, xv, full_attention_mask) if full_attention_mask is not None else (xk, xv)
+        else:
+            past_kv = None
 
         xq, xk, xv = (
             xq.transpose(1, 2),
@@ -173,7 +196,7 @@ class Attention(nn.Module):
         if self.flash and seq_len != 1:
             dropout_p = self.dropout if self.training else 0.0
             
-            if attention_mask is not None:
+            if attention_mask is not None or past_attention_mask is not None:
                 # Get the total key sequence length (includes past keys if using cache)
                 total_key_seq_len = xk.shape[2]  # xk shape: (bsz, n_heads, total_key_seq_len, head_dim)
                 
@@ -195,18 +218,23 @@ class Attention(nn.Module):
                         diagonal=1
                     )
                 
-                # Create proper padding mask based on the original attention_mask
-                # attention_mask represents which tokens should be attended to (1) vs ignored (0)
+                # Create proper padding mask using cached attention masks
                 if past_key_value is not None:
-                    # For KV-cache, we need to handle past and current attention masks
-                    past_seq_len = total_key_seq_len - seq_len
-                    # For past tokens, we cannot know their original padding state from current context
-                    # In a proper implementation, past attention mask should be cached and passed
-                    # For now, we conservatively assume past cached tokens are valid since they were
-                    # processed in previous forward passes. This is a limitation of the current interface.
-                    past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
-                    # Combine past and current attention masks
-                    full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                    # Use cached attention mask for past tokens if available
+                    if past_attention_mask is not None and attention_mask is not None:
+                        full_attention_mask = torch.cat([past_attention_mask, attention_mask], dim=1)
+                    elif past_attention_mask is not None:
+                        # Only past attention mask available (shouldn't happen in normal flow)
+                        full_attention_mask = past_attention_mask
+                    elif attention_mask is not None:
+                        # No cached past attention mask - this is the problematic case we're fixing
+                        # We'll use only current attention mask and assume past tokens are valid
+                        # This maintains some backward compatibility but still has limitations
+                        past_seq_len = total_key_seq_len - seq_len
+                        past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
+                        full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                    else:
+                        full_attention_mask = None
                 else:
                     full_attention_mask = attention_mask
                 
@@ -247,22 +275,29 @@ class Attention(nn.Module):
             causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             scores = scores + causal_mask
 
-            if attention_mask is not None:
-                # Handle padding mask properly for KV-cache scenarios
+            if attention_mask is not None or past_attention_mask is not None:
+                # Handle padding mask properly for KV-cache scenarios using cached attention masks
                 if past_key_value is not None:
-                    past_seq_len = total_key_seq_len - seq_len
-                    # For past tokens, we cannot know their original padding state from current context
-                    # In a proper implementation, past attention mask should be cached and passed
-                    # For now, we conservatively assume past cached tokens are valid since they were
-                    # processed in previous forward passes. This is a limitation of the current interface.
-                    past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
-                    full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                    # Use cached attention mask for past tokens if available
+                    if past_attention_mask is not None and attention_mask is not None:
+                        full_attention_mask = torch.cat([past_attention_mask, attention_mask], dim=1)
+                    elif past_attention_mask is not None:
+                        # Only past attention mask available (shouldn't happen in normal flow)
+                        full_attention_mask = past_attention_mask
+                    elif attention_mask is not None:
+                        # No cached past attention mask - fallback to previous behavior for backward compatibility
+                        past_seq_len = total_key_seq_len - seq_len
+                        past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
+                        full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                    else:
+                        full_attention_mask = None
                 else:
                     full_attention_mask = attention_mask
                 
-                extended_attention_mask = full_attention_mask.unsqueeze(1).unsqueeze(2)
-                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
-                scores = scores + extended_attention_mask
+                if full_attention_mask is not None:
+                    extended_attention_mask = full_attention_mask.unsqueeze(1).unsqueeze(2)
+                    extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                    scores = scores + extended_attention_mask
 
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             scores = self.attn_dropout(scores)
@@ -450,7 +485,7 @@ class MiniMindModel(nn.Module):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
                 **kwargs):
         batch_size, seq_length = input_ids.shape
@@ -507,7 +542,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
-                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
                 labels: Optional[torch.Tensor] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
