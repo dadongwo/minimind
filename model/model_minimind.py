@@ -178,17 +178,32 @@ class Attention(nn.Module):
                 total_key_seq_len = xk.shape[2]  # xk shape: (bsz, n_heads, total_key_seq_len, head_dim)
                 
                 # Create causal mask with correct dimensions: (seq_len, total_key_seq_len)
-                causal_mask = torch.triu(
-                    torch.full((seq_len, total_key_seq_len), float("-inf"), device=xq.device),
-                    diagonal=total_key_seq_len - seq_len + 1
-                )
+                if past_key_value is not None:
+                    past_seq_len = total_key_seq_len - seq_len
+                    # Create causal mask that allows all past positions and applies causal to current
+                    causal_mask = torch.zeros((seq_len, total_key_seq_len), device=xq.device)
+                    # Apply causal masking only to the current sequence portion
+                    current_causal = torch.triu(
+                        torch.full((seq_len, seq_len), float("-inf"), device=xq.device),
+                        diagonal=1
+                    )
+                    causal_mask[:, past_seq_len:] = current_causal
+                else:
+                    # Standard causal mask for non-cache scenario
+                    causal_mask = torch.triu(
+                        torch.full((seq_len, total_key_seq_len), float("-inf"), device=xq.device),
+                        diagonal=1
+                    )
                 
                 # Create proper padding mask based on the original attention_mask
                 # attention_mask represents which tokens should be attended to (1) vs ignored (0)
                 if past_key_value is not None:
                     # For KV-cache, we need to handle past and current attention masks
                     past_seq_len = total_key_seq_len - seq_len
-                    # Assume past tokens are all valid (attended to)
+                    # For past tokens, we cannot know their original padding state from current context
+                    # In a proper implementation, past attention mask should be cached and passed
+                    # For now, we conservatively assume past cached tokens are valid since they were
+                    # processed in previous forward passes. This is a limitation of the current interface.
                     past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
                     # Combine past and current attention masks
                     full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
@@ -212,16 +227,34 @@ class Attention(nn.Module):
             total_key_seq_len = xk.shape[2]
             
             # Create causal mask with correct dimensions
-            causal_mask = torch.triu(
-                torch.full((seq_len, total_key_seq_len), float("-inf"), device=scores.device),
-                diagonal=total_key_seq_len - seq_len + 1
-            ).unsqueeze(0).unsqueeze(0)
+            if past_key_value is not None:
+                past_seq_len = total_key_seq_len - seq_len
+                # Create causal mask that allows all past positions and applies causal to current
+                causal_mask = torch.zeros((seq_len, total_key_seq_len), device=scores.device)
+                # Apply causal masking only to the current sequence portion
+                current_causal = torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                    diagonal=1
+                )
+                causal_mask[:, past_seq_len:] = current_causal
+            else:
+                # Standard causal mask for non-cache scenario
+                causal_mask = torch.triu(
+                    torch.full((seq_len, total_key_seq_len), float("-inf"), device=scores.device),
+                    diagonal=1
+                )
+            
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
             scores = scores + causal_mask
 
             if attention_mask is not None:
                 # Handle padding mask properly for KV-cache scenarios
                 if past_key_value is not None:
                     past_seq_len = total_key_seq_len - seq_len
+                    # For past tokens, we cannot know their original padding state from current context
+                    # In a proper implementation, past attention mask should be cached and passed
+                    # For now, we conservatively assume past cached tokens are valid since they were
+                    # processed in previous forward passes. This is a limitation of the current interface.
                     past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
                     full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
                 else:
