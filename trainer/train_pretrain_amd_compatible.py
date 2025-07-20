@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import PretrainDataset
-from utils.device_utils import device_manager, get_optimal_device, get_device_specific_config
+from utils.device_utils import device_manager, get_optimal_device, get_device_specific_config, get_device_object
 
 # 仅抑制特定的非关键警告
 warnings.filterwarnings('ignore', category=UserWarning, message='.*weights_only.*')
@@ -71,36 +71,54 @@ def train_epoch(epoch, wandb):
             param_group['lr'] = lr
 
         with ctx:
-            logits = model(X).logits
+            res = model(X)
+            logits = res.logits
             loss = loss_fct(logits.view(-1, logits.size(-1)), Y.view(-1))
             loss = (loss * loss_mask.view(-1)).sum() / loss_mask.sum()
+            
+            # 添加MoE辅助损失（如果存在）
+            if hasattr(res, 'aux_loss') and res.aux_loss is not None:
+                loss += res.aux_loss
+            
+            # 梯度累积
+            loss = loss / args.accumulation_steps
 
-        # 使用设备兼容的梯度缩放
+        # 使用设备兼容的梯度缩放和正确的梯度处理
         if scaler is not None:
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            
+            if (step + 1) % args.accumulation_steps == 0:
+                # 在梯度裁剪前先unscale
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
         else:
             loss.backward()
-            optimizer.step()
-        
-        optimizer.zero_grad(set_to_none=True)
+            
+            if (step + 1) % args.accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         if step % 100 == 0:
             spend_time = time.time() - start_time
+            # 显示累积前的损失值
+            display_loss = loss.item() * args.accumulation_steps
             logger(
                 'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min:'.format(
                     epoch,
                     args.epochs,
                     step,
                     iter_per_epoch,
-                    loss.item(),
+                    display_loss,
                     optimizer.param_groups[-1]['lr'],
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
 
             if (wandb is not None) and (not ddp or ddp_local_rank == 0):
                 wandb.log({
-                    "loss": loss.item(),
+                    "loss": display_loss,
                     "lr": optimizer.param_groups[-1]['lr'],
                     "epoch": epoch,
                     "step": step
@@ -109,18 +127,24 @@ def train_epoch(epoch, wandb):
         if step % args.save_interval == 0:
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.out_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
-            if not ddp or ddp_local_rank == 0:
-                torch.save(model.state_dict(), ckp)
+            # 确保只有rank 0进程保存模型，避免多进程同时写入
+            if not ddp or dist.get_rank() == 0:
+                # 获取正确的state_dict，处理DDP包装的模型
+                state_dict = model.module.state_dict() if ddp else model.state_dict()
+                torch.save(state_dict, ckp)
                 logger(f'模型已保存: {ckp}')
 
         if step % 10000 == 0:
             # 使用设备管理器清空缓存
             device_manager.empty_cache()
 
-    if not ddp or ddp_local_rank == 0:
+    # 确保只有rank 0进程保存模型，避免多进程同时写入
+    if not ddp or dist.get_rank() == 0:
         moe_path = '_moe' if lm_config.use_moe else ''
         ckp = f'{args.out_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
-        torch.save(model.state_dict(), ckp)
+        # 获取正确的state_dict，处理DDP包装的模型
+        state_dict = model.module.state_dict() if ddp else model.state_dict()
+        torch.save(state_dict, ckp)
         logger(f'Epoch {epoch} 模型已保存: {ckp}')
         model.train()
 
@@ -179,6 +203,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--num_hidden_layers", type=int, default=8)
     parser.add_argument("--use_moe", action="store_true")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔步数")
     args = parser.parse_args()
@@ -193,8 +219,9 @@ if __name__ == "__main__":
     logger(f"设备配置: {device_config}")
 
     # 获取最优设备配置
-    args.device = get_optimal_device(args.device)
-    logger(f"使用设备: {args.device}")
+    device_str = get_optimal_device(args.device)
+    args.device = device_manager.device_from_string(device_str)
+    logger(f"使用设备: {device_str}")
     
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
 
@@ -221,7 +248,7 @@ if __name__ == "__main__":
 
     if ddp:
         init_distributed_mode()
-        args.device = torch.device(DEVICE)
+        args.device = device_manager.device_from_string(DEVICE)
         rank = dist.get_rank()
         # 使用设备管理器设置分布式随机种子
         device_manager.manual_seed(base_seed + rank)

@@ -1,6 +1,13 @@
 """
 MiniMind 设备兼容性工具模块
 支持 NVIDIA CUDA 和 AMD ROCm GPU 的统一管理
+
+修复说明:
+- get_default_device() 现在统一返回字符串格式的设备标识符
+- DirectML设备使用 "dml:x" 格式避免与torch.device()冲突
+- 新增 device_from_string() 方法处理设备字符串到对象的转换
+- 新增 get_device_object() 便捷函数直接获取设备对象
+- 确保分布式训练兼容性，避免DirectML设备类型不一致导致的运行时错误
 """
 
 import torch
@@ -109,27 +116,46 @@ class DeviceManager:
         else:
             return 0
     
-    def get_default_device(self, device_id: int = 0):
-        """获取默认设备
+    def get_default_device(self, device_id: int = 0) -> str:
+        """获取默认设备（统一返回字符串格式）
 
         Returns:
-            Union[str, torch.device]: 设备标识符或设备对象
-            - CUDA/ROCm: 返回字符串格式 "cuda:0"
-            - DirectML: 返回torch_directml.device对象
-            - CPU: 返回字符串 "cpu"
+            str: 设备标识符字符串
+            - CUDA/ROCm: 返回 "cuda:0" 格式
+            - DirectML: 返回 "dml:0" 格式（自定义标识符）
+            - CPU: 返回 "cpu"
         """
         if self.is_gpu_available():
             # ROCm使用cuda:x格式，因为PyTorch ROCm使用相同的API
             if self.device_type == "rocm":
                 return f"cuda:{device_id}"
             elif self.device_type == "directml":
-                # DirectML使用特殊的设备格式
-                import torch_directml
-                return torch_directml.device(device_id)
+                # DirectML使用自定义字符串标识符
+                return f"dml:{device_id}"
             else:
                 return f"{self.device_type}:{device_id}"
         else:
             return "cpu"
+    
+    def get_device_object(self, device_id: int = 0):
+        """获取设备对象（根据设备类型返回适当的设备对象）
+
+        Returns:
+            Union[torch.device, torch_directml.device]: 实际的设备对象
+            - CUDA/ROCm/CPU: 返回 torch.device 对象
+            - DirectML: 返回 torch_directml.device 对象
+        """
+        if self.is_gpu_available():
+            if self.device_type == "rocm":
+                return torch.device(f"cuda:{device_id}")
+            elif self.device_type == "directml":
+                # DirectML需要特殊的设备对象
+                import torch_directml
+                return torch_directml.device(device_id)
+            else:
+                return torch.device(f"{self.device_type}:{device_id}")
+        else:
+            return torch.device("cpu")
     
     def set_device(self, device_id: int):
         """设置当前设备"""
@@ -272,6 +298,24 @@ class DeviceManager:
         except Exception as e:
             print(f"🔧 ROCm功能检查失败: {e}")
 
+    def device_from_string(self, device_str: str):
+        """从设备字符串创建设备对象
+
+        Args:
+            device_str: 设备字符串（如 "cuda:0", "dml:0", "cpu"）
+
+        Returns:
+            Union[torch.device, torch_directml.device]: 对应的设备对象
+        """
+        if device_str.startswith("dml:"):
+            # DirectML设备
+            device_id = int(device_str.split(":")[-1]) if ":" in device_str else 0
+            import torch_directml
+            return torch_directml.device(device_id)
+        else:
+            # 标准PyTorch设备
+            return torch.device(device_str)
+
 
 # 全局设备管理器实例
 device_manager = DeviceManager()
@@ -283,6 +327,21 @@ def get_optimal_device(prefer_device: Optional[str] = None) -> str:
         return prefer_device
     
     return device_manager.get_default_device()
+
+
+def get_device_object(device_str: Optional[str] = None):
+    """获取设备对象
+    
+    Args:
+        device_str: 设备字符串，如果为None则使用默认设备
+        
+    Returns:
+        Union[torch.device, torch_directml.device]: 设备对象
+    """
+    if device_str is None:
+        device_str = device_manager.get_default_device()
+    
+    return device_manager.device_from_string(device_str)
 
 
 def get_distributed_backend():

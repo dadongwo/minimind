@@ -172,14 +172,24 @@ class Attention(nn.Module):
 
         if self.flash and seq_len != 1:
             dropout_p = self.dropout if self.training else 0.0
-            attn_mask = None
+            
             if attention_mask is not None:
-                attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
-                attn_mask = attn_mask.bool() if attention_mask is not None else None
-
-            # 修复PyTorch兼容性：不能同时设置attn_mask和is_causal=True
-            if attn_mask is not None:
-                output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False)
+                # Create combined mask that includes both causal and padding masks
+                # Start with causal mask
+                causal_mask = torch.triu(
+                    torch.full((seq_len, seq_len), float("-inf"), device=xq.device),
+                    diagonal=1
+                )
+                # Expand attention_mask to match the shape needed for SDPA
+                padding_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
+                # Convert padding mask to additive form (0 for attend, -inf for ignore)
+                padding_mask = (1.0 - padding_mask.float()) * float("-inf")
+                
+                # Combine causal and padding masks
+                combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) + padding_mask
+                combined_mask = combined_mask.bool() if combined_mask.dtype != torch.bool else combined_mask
+                
+                output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=combined_mask, dropout_p=dropout_p, is_causal=False)
             else:
                 output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=dropout_p, is_causal=True)
         else:
@@ -272,7 +282,7 @@ class MoEGate(nn.Module):
                 fi = ce * self.n_routed_experts
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
-            aux_loss = 0
+            aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         return topk_idx, topk_weight, aux_loss
 
 
@@ -407,11 +417,18 @@ class MiniMindModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
 
-        aux_loss = sum(
+        # 计算MoE辅助损失
+        moe_aux_losses = [
             layer.mlp.aux_loss
             for layer in self.layers
             if isinstance(layer.mlp, MOEFeedForward)
-        )
+        ]
+        
+        if moe_aux_losses:
+            aux_loss = sum(moe_aux_losses)
+        else:
+            # 当没有MoE层时，创建一个零张量保持梯度兼容性
+            aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
         return hidden_states, presents, aux_loss
 

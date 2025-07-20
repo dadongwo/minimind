@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import PretrainDataset
-from utils.device_utils import device_manager, get_optimal_device
+from utils.device_utils import device_manager, get_optimal_device, get_device_object
 
 warnings.filterwarnings('ignore')
 
@@ -149,7 +149,8 @@ if __name__ == "__main__":
     device_manager.print_device_info()
 
     # 获取最优设备配置
-    args.device = get_optimal_device(args.device)
+    device_str = get_optimal_device(args.device)
+    args.device = device_manager.device_from_string(device_str)
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
@@ -174,7 +175,7 @@ if __name__ == "__main__":
 
     if ddp:
         init_distributed_mode()
-        args.device = torch.device(DEVICE)
+        args.device = device_manager.device_from_string(DEVICE)
         rank = dist.get_rank()
         # 使用设备管理器设置分布式随机种子
         device_manager.manual_seed(base_seed + rank)
