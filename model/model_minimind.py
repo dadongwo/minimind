@@ -174,34 +174,60 @@ class Attention(nn.Module):
             dropout_p = self.dropout if self.training else 0.0
             
             if attention_mask is not None:
-                # Create combined mask that includes both causal and padding masks
-                # Start with causal mask
+                # Get the total key sequence length (includes past keys if using cache)
+                total_key_seq_len = xk.shape[2]  # xk shape: (bsz, n_heads, total_key_seq_len, head_dim)
+                
+                # Create causal mask with correct dimensions: (seq_len, total_key_seq_len)
                 causal_mask = torch.triu(
-                    torch.full((seq_len, seq_len), float("-inf"), device=xq.device),
-                    diagonal=1
+                    torch.full((seq_len, total_key_seq_len), float("-inf"), device=xq.device),
+                    diagonal=total_key_seq_len - seq_len + 1
                 )
-                # Expand attention_mask to match the shape needed for SDPA
-                padding_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
-                # Convert padding mask to additive form (0 for attend, -inf for ignore)
+                
+                # Create proper padding mask based on the original attention_mask
+                # attention_mask represents which tokens should be attended to (1) vs ignored (0)
+                if past_key_value is not None:
+                    # For KV-cache, we need to handle past and current attention masks
+                    past_seq_len = total_key_seq_len - seq_len
+                    # Assume past tokens are all valid (attended to)
+                    past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
+                    # Combine past and current attention masks
+                    full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                else:
+                    full_attention_mask = attention_mask
+                
+                # Convert to additive mask format and expand for heads and query positions
+                padding_mask = full_attention_mask.unsqueeze(1).unsqueeze(2)  # (bsz, 1, 1, total_key_seq_len)
+                padding_mask = padding_mask.expand(bsz, self.n_local_heads, seq_len, total_key_seq_len)
                 padding_mask = (1.0 - padding_mask.float()) * float("-inf")
                 
                 # Combine causal and padding masks
                 combined_mask = causal_mask.unsqueeze(0).unsqueeze(0) + padding_mask
-                # For additive masks: 0.0 = attend, -inf = ignore
-                # Keep as additive mask for scaled_dot_product_attention
                 
                 output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=combined_mask, dropout_p=dropout_p, is_causal=False)
             else:
                 output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=dropout_p, is_causal=True)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores + torch.triu(
-                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
-                diagonal=1
-            ).unsqueeze(0).unsqueeze(0)  # scores+mask
+            # Get the total key sequence length for proper causal mask sizing
+            total_key_seq_len = xk.shape[2]
+            
+            # Create causal mask with correct dimensions
+            causal_mask = torch.triu(
+                torch.full((seq_len, total_key_seq_len), float("-inf"), device=scores.device),
+                diagonal=total_key_seq_len - seq_len + 1
+            ).unsqueeze(0).unsqueeze(0)
+            scores = scores + causal_mask
 
             if attention_mask is not None:
-                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                # Handle padding mask properly for KV-cache scenarios
+                if past_key_value is not None:
+                    past_seq_len = total_key_seq_len - seq_len
+                    past_attention = torch.ones((bsz, past_seq_len), device=attention_mask.device, dtype=attention_mask.dtype)
+                    full_attention_mask = torch.cat([past_attention, attention_mask], dim=1)
+                else:
+                    full_attention_mask = attention_mask
+                
+                extended_attention_mask = full_attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 

@@ -113,7 +113,7 @@ def train_epoch(epoch, wandb):
                     "step": step
                 })
 
-        if step % args.save_interval == 0:
+        if step > 0 and step % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.out_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
