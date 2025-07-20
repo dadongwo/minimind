@@ -2,11 +2,37 @@ import argparse
 import random
 import warnings
 import numpy as np
+import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from model.model_lora import *
 
 warnings.filterwarnings('ignore')
+
+
+def move_to_device(model_or_tensor, device_arg):
+    """统一的设备转移函数
+
+    Args:
+        model_or_tensor: 要转移的模型或张量
+        device_arg: 设备参数
+
+    Returns:
+        转移到指定设备的模型或张量
+    """
+    if device_arg == 'auto':
+        from utils.device_utils import device_manager
+        if device_manager.device_type == 'directml':
+            import torch_directml
+            return model_or_tensor.to(torch_directml.device())
+        else:
+            device = device_manager.get_default_device()
+            return model_or_tensor.to(device)
+    elif 'privateuseone' in str(device_arg):
+        import torch_directml
+        return model_or_tensor.to(torch_directml.device())
+    else:
+        return model_or_tensor.to(device_arg)
 
 
 def init_model(args):
@@ -22,7 +48,26 @@ def init_model(args):
             use_moe=args.use_moe
         ))
 
-        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        # 支持DirectML设备的模型加载
+        if args.device == 'auto':
+            from utils.device_utils import device_manager
+            device = device_manager.get_default_device()
+            if device_manager.device_type == 'directml':
+                # DirectML需要先加载到CPU再转移
+                state_dict = torch.load(ckp, map_location='cpu')
+                model.load_state_dict(state_dict, strict=True)
+                import torch_directml
+                model = model.to(torch_directml.device())
+            else:
+                model.load_state_dict(torch.load(ckp, map_location=device), strict=True)
+        elif 'privateuseone' in args.device:
+            # DirectML设备
+            state_dict = torch.load(ckp, map_location='cpu')
+            model.load_state_dict(state_dict, strict=True)
+            import torch_directml
+            model = model.to(torch_directml.device())
+        else:
+            model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
 
         if args.lora_name != 'None':
             apply_lora(model)
@@ -32,7 +77,10 @@ def init_model(args):
         tokenizer = AutoTokenizer.from_pretrained(transformers_model_path)
         model = AutoModelForCausalLM.from_pretrained(transformers_model_path, trust_remote_code=True)
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M(illion)')
-    return model.eval().to(args.device), tokenizer
+
+    # 使用统一的设备转移函数
+    model = move_to_device(model.eval(), args.device)
+    return model, tokenizer
 
 
 def get_prompt_datas(args):
@@ -145,7 +193,11 @@ def main():
             new_prompt,
             return_tensors="pt",
             truncation=True
-        ).to(args.device)
+        )
+
+        # 使用统一的设备转移函数
+        for key in inputs:
+            inputs[key] = move_to_device(inputs[key], args.device)
 
         print('🤖️: ', end='')
         generated_ids = model.generate(

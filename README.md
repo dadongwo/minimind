@@ -111,6 +111,7 @@
 - 从0实现预训练、指令微调、LoRA、DPO强化学习，白盒模型蒸馏。关键算法几乎不依赖第三方封装的框架，且全部开源。
 - 同时兼容`transformers`、`trl`、`peft`等第三方主流框架。
 - 训练支持单机单卡、单机多卡(DDP、DeepSpeed)训练，支持wandb可视化训练流程。支持动态启停训练。
+- **多GPU支持**: 完全兼容NVIDIA GPU (CUDA)、AMD GPU (ROCm/DirectML)，自动检测最优设备配置。
 - 在第三方测评榜（C-Eval、C-MMLU、OpenBookQA等）进行模型测试。
 - 实现Openai-Api协议的极简服务端，便于集成到第三方ChatUI使用（FastGPT、Open-WebUI等）。
 - 基于streamlit实现最简聊天WebUI前端。
@@ -273,6 +274,27 @@ vllm serve ./MiniMind2/ --served-model-name "minimind"
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 ```
 
+#### GPU支持
+
+**NVIDIA GPU (推荐)**
+```python
+import torch
+print(torch.cuda.is_available())
+```
+
+**AMD GPU (Windows)**
+```bash
+# 安装DirectML版本的PyTorch
+pip uninstall torch torchvision torchaudio -y
+pip install torch-directml
+```
+
+**AMD GPU (Linux)**
+```bash
+# 安装ROCm版本的PyTorch
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
+```
+
 <details style="color:rgb(128,128,128)">
 <summary>注：提前测试Torch是否可用cuda</summary>
 
@@ -307,10 +329,20 @@ print(torch.cuda.is_available())
 **3.1 预训练（学知识）**
 
 ```bash
+# NVIDIA GPU / CPU
 python train_pretrain.py
+
+# AMD GPU (自动检测)
+python train_pretrain_amd_compatible.py --device auto
+
+# 指定设备类型
+python train_pretrain.py --device cuda:0  # NVIDIA GPU
+python train_pretrain.py --device cpu     # CPU
 ```
 
 > 执行预训练，得到 `pretrain_*.pth` 作为预训练的输出权重（其中*为模型的dimension，默认为512）
+>
+> **注意**: AMD GPU用户请使用 `train_pretrain_amd_compatible.py` 脚本以获得最佳兼容性
 
 
 **3.2 监督微调（学对话方式）**

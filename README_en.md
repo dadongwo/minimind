@@ -120,6 +120,7 @@ the entire process of building a language model from 0 to 1. Let's enjoy the fun
 - Compatible with third-party frameworks like `transformers`, `trl`, `peft`, etc.
 - Training supports single machine single GPU, single machine multi-GPU (DDP, DeepSpeed), and wandb visualized training
   processes. Supports dynamic start/stop of training.
+- **Multi-GPU Support**: Fully compatible with NVIDIA GPU (CUDA), AMD GPU (ROCm/DirectML), with automatic optimal device configuration detection.
 - Model testing on third-party evaluation benchmarks (C-Eval, C-MMLU, OpenBookQA, etc.).
 - A minimal server implementing the Openai-Api protocol, easy to integrate into third-party ChatUI applications (
   FastGPT, Open-WebUI, etc.).
@@ -294,6 +295,27 @@ vllm serve ./MiniMind2/ --served-model-name "minimind"
 
 ```bash
 pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+#### GPU Support
+
+**NVIDIA GPU (Recommended)**
+```python
+import torch
+print(torch.cuda.is_available())
+```
+
+**AMD GPU (Windows)**
+```bash
+# Install DirectML version of PyTorch
+pip uninstall torch torchvision torchaudio -y
+pip install torch-directml
+```
+
+**AMD GPU (Linux)**
+```bash
+# Install ROCm version of PyTorch
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm5.7
 ```
 
 <details style="color:rgb(128,128,128)">

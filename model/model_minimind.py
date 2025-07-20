@@ -177,7 +177,11 @@ class Attention(nn.Module):
                 attn_mask = attention_mask.view(bsz, 1, 1, -1).expand(bsz, self.n_local_heads, seq_len, -1)
                 attn_mask = attn_mask.bool() if attention_mask is not None else None
 
-            output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=True)
+            # 修复PyTorch兼容性：不能同时设置attn_mask和is_causal=True
+            if attn_mask is not None:
+                output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=False)
+            else:
+                output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=dropout_p, is_causal=True)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores = scores + torch.triu(
@@ -427,6 +431,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                labels: Optional[torch.Tensor] = None,
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
@@ -439,8 +444,18 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(h[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            # 计算交叉熵损失
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('loss', loss)
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)
         return self.OUT

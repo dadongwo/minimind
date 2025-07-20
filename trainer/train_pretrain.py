@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import PretrainDataset
+from utils.device_utils import device_manager, get_optimal_device
 
 warnings.filterwarnings('ignore')
 
@@ -105,23 +106,27 @@ def init_distributed_mode():
     if not ddp: return
     global ddp_local_rank, DEVICE
 
-    dist.init_process_group(backend="nccl")
+    # 使用设备管理器获取合适的后端
+    backend = device_manager.get_distributed_backend()
+    dist.init_process_group(backend=backend)
     ddp_rank = int(os.environ["RANK"])
     ddp_local_rank = int(os.environ["LOCAL_RANK"])
     ddp_world_size = int(os.environ["WORLD_SIZE"])
-    DEVICE = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(DEVICE)
+
+    # 使用设备管理器设置设备
+    DEVICE = device_manager.get_default_device(ddp_local_rank)
+    device_manager.set_device(ddp_local_rank)
 
 
 # torchrun --nproc_per_node 2 1-pretrain.py
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
-    parser.add_argument("--out_dir", type=str, default="../out")
+    parser.add_argument("--out_dir", type=str, default="out")
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="auto", help="设备类型: auto, cuda:0, cpu 等")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
@@ -140,31 +145,39 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
     args = parser.parse_args()
 
+    # 打印设备信息
+    device_manager.print_device_info()
+
+    # 获取最优设备配置
+    args.device = get_optimal_device(args.device)
+
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+
+    # 使用设备管理器判断设备类型
+    device_type = device_manager.device_type if device_manager.is_gpu_available() else "cpu"
 
     args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
-    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+    # 使用设备管理器获取AMP上下文
+    ctx = device_manager.get_amp_context(enabled=(device_type != "cpu"))
 
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-    ddp_local_rank, DEVICE = 0, "cuda:0"
+    ddp_local_rank, DEVICE = 0, device_manager.get_default_device(0)
 
     base_seed = 1337
-    torch.manual_seed(base_seed)
-    torch.cuda.manual_seed(base_seed)
+    # 使用设备管理器设置随机种子
+    device_manager.manual_seed(base_seed)
 
     if ddp:
         init_distributed_mode()
         args.device = torch.device(DEVICE)
         rank = dist.get_rank()
-        torch.manual_seed(base_seed + rank)
-        # 同时设置 CUDA 的随机种子
-        torch.cuda.manual_seed(base_seed + rank)
+        # 使用设备管理器设置分布式随机种子
+        device_manager.manual_seed(base_seed + rank)
 
     if args.use_wandb and (not ddp or ddp_local_rank == 0):
         import wandb
@@ -186,12 +199,15 @@ if __name__ == "__main__":
         sampler=train_sampler
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    # 使用设备管理器获取梯度缩放器
+    scaler = device_manager.get_grad_scaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
-        model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
+        # 对于ROCm，device_ids应该使用实际的设备ID
+        device_ids = [ddp_local_rank] if device_manager.is_gpu_available() else None
+        model = DistributedDataParallel(model, device_ids=device_ids)
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
